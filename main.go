@@ -1,7 +1,8 @@
 package main
 
 import (
-	"context"   //Пакет для работы с контекстом
+	"context" //Пакет для работы с контекстом
+	"fmt"
 	"log"       //Пакеты для логирования. Записи событий в лог-файл
 	"os"        //Пакет для работы с переменными окружения
 	"os/signal" //Пакет для работы с сигналами операционной системы
@@ -105,6 +106,10 @@ func main() {
 	if err := godotenv.Load(); err != nil { //Загружает переменные окружения из файла .env
 		log.Panic("Ошибка загрузки файла .env") // Если произошла ошибка, то выводит ее в лог
 	}
+
+	db := initDB()
+	defer db.Close()
+
 	token := os.Getenv("TELEGRAM_BOT_TOKEN") // Получаем токен из переменной окружения
 	if token == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN не задан") // Если токен не установлен, выводим ошибку
@@ -115,8 +120,11 @@ func main() {
 		log.Panic(err)
 	}
 
-	db := initDB()
-	defer db.Close()
+	// Удаляем существующий вебхук
+	_, err = bot.Request(tgbotapi.DeleteWebhookConfig{DropPendingUpdates: true})
+	if err != nil {
+		log.Panic("Ошибка удаления вебхука: ", err)
+	}
 
 	// Библиотека будет выводить в консоль сырые запросы/ответы к Telegram API.
 	bot.Debug = true
@@ -170,120 +178,161 @@ func main() {
 				// Massege - само сообщение
 				// From - информация о пользователе, который отправил сообщение
 				// UserName - имя пользователя, который отправил сообщение
-				log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
-
-				//Обработка изображений
-				if update.Message.Photo != nil {
-					//Берем последнее самое качественное фото из массива
-					photo := update.Message.Photo[len(update.Message.Photo)-1]
-					fileURL, err := bot.GetFileDirectURL(photo.FileID)
-					if err != nil {
-						logError("Ошибка получения файла: %v", err)
-						msg = tgbotapi.NewMessage(chatID, "Не удалось обработать фото")
-					} else {
-						msg = tgbotapi.NewMessage(chatID, "Фото сохранено! Вот ссылка: "+fileURL)
-						//TODO: здесь можно сохрнаить файл в БД
-					}
-					bot.Send(msg)
-					continue
-				}
-				//Обработка документов
-				if update.Message.Document != nil {
-					fileURL.err := bot.GetFileDirectURL(update.Message.Document.FileID)
-					if err != nil {
-						logError("Ошибка получения документа: %v", err)
-						msg = tgbotapi.NewMessage(chatID, "Ошибка загрузки файла")
-					} else {
-						msg = tgbotapi.NewMessage(chatID, "Документ получен! Вот ссылка "+fileURL)
-					}
-					bot.Send(msg)
-					continue
-				}
-
-				var msg tgbotapi.MessageConfig
-				switch update.Message.Command() {
-				case "start":
-					//Сохранение пользователя
-					user := User{
-						ID:        update.Message.From.ID,
-						UserName:  update.Message.From.UserName,
-						FirstName: update.Message.From.FirstName,
-						CreatedAt: time.Now(),
-					}
-					msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите действия")
-					msg.ReplyMarkup = createKeyBoard()
-				case "help":
-					msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Вот список доступных команд:\n/start - начать взаимодействие\n/help - получить помощь\n/about - узнать версию бота, его создателя и связь с ним\n/stats - показать статистику бота.")
-				case "about":
-					msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Версия 1.0.0\nАвтор: Кирилл Тахмазиди\nTelegram: @tahmazidik")
-				case "stats":
-					if isAdmin(update.Message.From.ID) {
-						count := getTotalUsers(db)
-						msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Всего пользователей: %d", count)
-					}
-				case "broadcast":
-					if isAdmin(update.Message.From.ID) {
-						//Получаем текст рассылки
-						args := update.Message.CommandArguments()
-						if args == "" {
-							msg = tgbotapi.NewMessage(charID, "Укажите текст рассылки: /broadcast Привет всем!")
-							break
-						}
-
-						//Получаем всех пользователей из БД
-						users, err := getAllUsers()
-						if err != nil {
-							logError("Ошибка получение пользователей: %v", err)
-							break
-						}
-
-						//Отправляем каждому
-						for _, user := range users {
-							broadcastMsg := tgbotapi.NewMessage(user.ID, args)
-							if _, err := bot.Send(broadcastMsg); err != nil {
-								logError("Ошибка отправка пользователю %d %v", user.ID, err)
-							}
-						}
-						msg = tgbotapi.NewMessage(charID, "Рассылка завершена!")
-					} else {
-						msg = tgbotapi.NewMessage(chatID, "У вас нет прав на эту команду")
-					}
-				default:
-					if !update.Message.IsCommand() {
-						msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Вы написали: "+update.Message.Text)
-					} else {
-						msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Я не знаю такой команды. Напиши /help, чтобы получить список доступных команд.")
-					}
-				}
-
-				if _, err := bot.Send(msg); err != nil {
-					logError("Ошибка отправки сообщения: %v", err)
-				}
+				processMessage(db, bot, update.Message)
 			}
-
-			// Обработка нажатий на inline-кнопки
 			if update.CallbackQuery != nil {
-				callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-				if _, err := bot.Send(callback); err != nil {
-					logError("Ошибка отправки callback: %v", err)
-				}
-
-				var msgText string
-				switch update.CallbackQuery.Data {
-				case "help":
-					msgText = "Используй команды /start и /about"
-				case "about":
-					msgText = "Версия 1.0.0\nАвтор: Кирилл Тахмазиди\nTelegram: @tahmazidik"
-				default:
-					msgText = "Неизвестная команда кнопки"
-				}
-				msg := tgbotapi.NewMessage(update.CallbackQuery.Message.Chat.ID, msgText)
-				if _, err := bot.Send(msg); err != nil {
-					logError("Ошибка отправки сообщения: %v", err)
-				}
+				processCallback(bot, update.CallbackQuery)
 			}
 		}
 	}
+}
+
+func processMessage(db *sql.DB, bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	log.Printf("[%s] %s", msg.From.UserName, msg.Text)
+
+	if msg.Photo != nil {
+		handlePhoto(bot, msg)
+		return
+	}
+
+	if msg.Document != nil {
+		handleDocument(bot, msg)
+		return
+	}
+
+	var response tgbotapi.MessageConfig
+	switch msg.Command() {
+	case "start":
+		response = handleStart(db, msg)
+	case "help":
+		response = tgbotapi.NewMessage(msg.Chat.ID, helpText())
+	case "about":
+		response = tgbotapi.NewMessage(msg.Chat.ID, aboutText())
+	case "stats":
+		response = handleStats(db, msg)
+	case "broadcast":
+		response = handleBroadcast(db, bot, msg)
+	default:
+		response = handleDefault(msg)
+	}
+
+	if _, err := bot.Send(response); err != nil {
+		logError("Ошибка отправки сообщения: %v", err)
+	}
+}
+
+func handlePhoto(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	photo := msg.Photo[len(msg.Photo)-1]
+	fileURL, _ := bot.GetFileDirectURL(photo.FileID)
+	response := tgbotapi.NewMessage(msg.Chat.ID, "Фото сохранено! Вот ссылка"+fileURL)
+	bot.Send(response)
+}
+
+func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
+	response := tgbotapi.NewMessage(msg.Chat.ID, "Документ получен! Вот ссылка"+fileURL)
+	bot.Send(response)
+}
+
+func handleStart(db *sql.DB, msg *tgbotapi.Message) tgbotapi.MessageConfig {
+	user := User{
+		ID:        msg.From.ID,
+		Username:  msg.From.UserName,
+		FirstName: msg.From.FirstName,
+		CreatedAt: time.Now(),
+	}
+
+	if err := saveUsers(db, user); err != nil {
+		logError("Ошибка сохранения пользователя: %v", err)
+	}
+
+	response := tgbotapi.NewMessage(msg.Chat.ID, "Выберите действия")
+	response.ReplyMarkup = createKeyBoard()
+	return response
+}
+
+func handleStats(db *sql.DB, msg *tgbotapi.Message) tgbotapi.MessageConfig {
+	if !isAdmin(msg.From.ID) {
+		return tgbotapi.NewMessage(msg.Chat.ID, "У вас нет прав на эту команду")
+	}
+
+	users, err := getAllUsers(db)
+	if err != nil {
+		logError("Ошибка получения пользователей: %v", err)
+		return tgbotapi.NewMessage(msg.Chat.ID, "Ошибка получения пользователей")
+	}
+
+	return tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Всего пользователей: %d", len(users)))
+}
+
+func handleBroadcast(db *sql.DB, bot *tgbotapi.BotAPI, msg *tgbotapi.Message) tgbotapi.MessageConfig {
+	if !isAdmin(msg.From.ID) {
+		logError("У вас нет прав на эту команду", msg.From.ID)
+		return tgbotapi.NewMessage(msg.Chat.ID, "У вас нет прав на эту команду")
+	}
+
+	text := msg.CommandArguments()
+	if text == "" {
+		return tgbotapi.NewMessage(msg.Chat.ID, "Укажите текст рассылки: /broadcast ваш_текст")
+	}
+
+	users, err := getAllUsers(db)
+	if err != nil {
+		logError("Ошибка получения пользователей: %v", err)
+		return tgbotapi.NewMessage(msg.Chat.ID, "Ошибка получения пользователей")
+	}
+
+	for _, user := range users {
+		m := tgbotapi.NewMessage(user.ID, text)
+		if _, err := bot.Send(m); err != nil {
+			logError("Ошибка отправки %d: %v", user.ID, err)
+		}
+	}
+	return tgbotapi.NewMessage(msg.Chat.ID, "Рассылка завершена")
+}
+
+func handleDefault(msg *tgbotapi.Message) tgbotapi.MessageConfig {
+	if msg.IsCommand() {
+		return tgbotapi.NewMessage(msg.Chat.ID, "Неизвестная команда")
+	}
+	return tgbotapi.NewMessage(msg.Chat.ID, "Вы написали: "+msg.Text)
+}
+
+func processCallback(bot *tgbotapi.BotAPI, callback *tgbotapi.CallbackQuery) {
+	callbackCondig := tgbotapi.NewCallback(callback.ID, "")
+	if _, err := bot.Send(callbackCondig); err != nil {
+		logError("Ошибка отправки callback: %v", err)
+	}
+
+	var msgText string
+	switch callback.Data {
+	case "help":
+		msgText = helpText()
+	case "about":
+		msgText = aboutText()
+	default:
+		msgText = "Неизвестная команда"
+	}
+
+	msg := tgbotapi.NewMessage(callback.Message.Chat.ID, msgText)
+	if _, err := bot.Send(msg); err != nil {
+		logError("Ошибка отправки: %v", err)
+	}
+}
+
+func helpText() string {
+	return `Доступные команды:
+/start - Начать работу
+/help - Помощь
+/about - О боте
+/stats - Статистика (админы)
+/broadcast - Рассылка (админы)`
+}
+
+func aboutText() string {
+	return `Версия 1.1
+Автор: Кирилл Тахмазиди
+Telegram: @tahmazidik`
 }
 
 // 	   При нажатии Ctrl+C:
