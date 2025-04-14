@@ -3,10 +3,14 @@ package main
 import (
 	"context" //Пакет для работы с контекстом
 	"fmt"
-	"log"       //Пакеты для логирования. Записи событий в лог-файл
+	"io"
+	"log" //Пакеты для логирования. Записи событий в лог-файл
+	"net/http"
 	"os"        //Пакет для работы с переменными окружения
 	"os/signal" //Пакет для работы с сигналами операционной системы
-	"syscall"   //Пакет для работы с системными вызовами
+	"path/filepath"
+	"strings"
+	"syscall" //Пакет для работы с системными вызовами
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5" //Пакет для работы с Telegram Bot API
@@ -126,6 +130,12 @@ func main() {
 		log.Panic("Ошибка удаления вебхука: ", err)
 	}
 
+	//Создаем папку для загрузок
+	if err := os.MkdirAll("downloads", 0755); err != nil {
+		log.Panicf("Не могу создать папку downloads: %v", err)
+	}
+	logInfo("Папка для загрузок готова")
+
 	// Библиотека будет выводить в консоль сырые запросы/ответы к Telegram API.
 	bot.Debug = true
 	//После успешного подключение выводит в консоль имя бота
@@ -223,15 +233,106 @@ func processMessage(db *sql.DB, bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 func handlePhoto(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	photo := msg.Photo[len(msg.Photo)-1]
-	fileURL, _ := bot.GetFileDirectURL(photo.FileID)
-	response := tgbotapi.NewMessage(msg.Chat.ID, "Фото сохранено! Вот ссылка"+fileURL)
+
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: photo.FileID})
+	if err != nil {
+		logError("Ошибка получения файла: %v", err)
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Ошибка обработки фото"))
+		return
+	}
+
+	//Формируем путь для сохранения
+	filePath := fmt.Sprintf("downloads/photo_%d_%s.jpg", msg.From.ID, time.Now().Format("20060102_150405"))
+
+	if err := downloadAndSaveFile(bot, file.FilePath, filePath); err != nil {
+		logError("Ошибка сохранения: %v", err)
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Не удалось сохранить фото"))
+		return
+	}
+
+	//Отправляем подтверждение
+	response := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Фото сохранено как: %s", filePath))
 	bot.Send(response)
 }
 
 func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	fileURL, _ := bot.GetFileDirectURL(msg.Document.FileID)
-	response := tgbotapi.NewMessage(msg.Chat.ID, "Документ получен! Вот ссылка"+fileURL)
+	doc := msg.Document
+
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: doc.FileID})
+	if err != nil {
+		logError("Ошибка получения: %v", err)
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Ошибка обработки файла"))
+		return
+	}
+
+	fileExt := filepath.Ext(doc.FileName)
+	mimType := strings.ToLower(doc.MimeType)
+
+	switch {
+	case strings.HasPrefix(mimType, "video/"):
+		fileExt = ".mp4"
+	case strings.HasPrefix(mimType, "image/"):
+		fileExt = ".jpg"
+	case strings.HasPrefix(mimType, "audio/"):
+		fileExt = ".mp3"
+	case mimType == "application/pdf":
+		fileExt = ".pdf"
+	case mimType == "text/plain":
+		fileExt = ".txt"
+	case mimType == "":
+		if fileExt == "" {
+			fileExt = ".bin"
+		}
+	}
+
+	//Формируем уникальное имя файла
+	fileName := fmt.Sprintf("%s_%d_%s%s",
+		strings.TrimSuffix(doc.FileName, filepath.Ext(doc.FileName)), //Базовое имя
+		msg.From.ID,                          //ID пользователя
+		time.Now().Format("20060102_150405"), //Дата
+		fileExt,                              //Расширения
+	)
+
+	//Формируем путь с оригинальным путем
+	filePath := filepath.Join("downloads/%s_%d_%s", fileName)
+	//Скачиваем и сохраняем
+	if err := downloadAndSaveFile(bot, file.FilePath, filePath); err != nil {
+		logError("Ошибка сохранения: %v", err)
+		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Не удалось сохранить файл"))
+		return
+	}
+	response := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Файл сохранен как: %s", fileName))
+
 	bot.Send(response)
+}
+
+// Общая функция для скачивания
+func downloadAndSaveFile(bot *tgbotapi.BotAPI, fileID string, destination string) error {
+	//Скачиваем файл
+	fileURL, err := bot.GetFileDirectURL(fileID)
+	//reader, err := bot.GetFileReader(filePath)
+	if err != nil {
+		return err
+	}
+
+	//Создаем файл для записи
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	outFile, err := os.Create(destination)
+	if err != nil {
+		return nil
+	}
+	defer outFile.Close()
+
+	if _, err := io.Copy(outFile, resp.Body); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func handleStart(db *sql.DB, msg *tgbotapi.Message) tgbotapi.MessageConfig {
