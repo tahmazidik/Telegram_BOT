@@ -51,7 +51,15 @@ func initDB() *sql.DB {
 }
 
 func saveUsers(db *sql.DB, user User) error {
-	_, err := db.Exec(`
+	var exists bool
+	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)", user.ID).Scan(&exists)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	_, err = db.Exec(`
 		INSERT INTO users(id, username, first_name, created_at)
 		VALUES(?, ?, ?, ?)`,
 		user.ID, user.Username, user.FirstName, user.CreatedAt)
@@ -234,9 +242,11 @@ func processMessage(db *sql.DB, bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 func handlePhoto(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	photo := msg.Photo[len(msg.Photo)-1]
 
-	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: photo.FileID})
+	fileID := photo.FileID
+
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
-		logError("Ошибка получения файла: %v", err)
+		logError("Ошибка получения файла (ID: %s) %v", fileID, err)
 		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Ошибка обработки фото"))
 		return
 	}
@@ -252,6 +262,7 @@ func handlePhoto(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	//Отправляем подтверждение
 	response := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Фото сохранено как: %s", filePath))
+	logInfo("Фото пользователя %d сохранено: %s", msg.From.ID, filePath)
 	bot.Send(response)
 }
 
@@ -294,7 +305,7 @@ func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	)
 
 	//Формируем путь с оригинальным путем
-	filePath := filepath.Join("downloads/%s_%d_%s", fileName)
+	filePath := filepath.Join("downloads", fileName)
 	//Скачиваем и сохраняем
 	if err := downloadAndSaveFile(bot, file.FilePath, filePath); err != nil {
 		logError("Ошибка сохранения: %v", err)
@@ -302,35 +313,49 @@ func handleDocument(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 	response := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Файл сохранен как: %s", fileName))
+	logInfo("Документ пользователя %d сохранен: %s", msg.From.ID, fileName)
 
 	bot.Send(response)
 }
 
 // Общая функция для скачивания
 func downloadAndSaveFile(bot *tgbotapi.BotAPI, fileID string, destination string) error {
-	//Скачиваем файл
-	fileURL, err := bot.GetFileDirectURL(fileID)
-	//reader, err := bot.GetFileReader(filePath)
+	logInfo("Скачивание файла: ID=%s → %s", fileID, destination)
+	//Напрямую используем файл
+	file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		return err
+	}
+	//Получаем конкретный URL через Link
+	fileURL := file.Link(bot.Token)
+	logInfo("URL файла: %s", fileURL)
+	//reader, err := bot.GetFileReader(filePath)
+	if fileURL == "" {
+		return fmt.Errorf("file URL is empty")
 	}
 
 	//Создаем файл для записи
 	resp, err := http.Get(fileURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("HTTP error: %v", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status code: %v", resp.StatusCode)
+	}
+
 	outFile, err := os.Create(destination)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer outFile.Close()
 
 	if _, err := io.Copy(outFile, resp.Body); err != nil {
 		return err
 	}
+
+	logInfo("Файл сохранен: %s (%d байт)", destination, resp.ContentLength)
 
 	return nil
 }
